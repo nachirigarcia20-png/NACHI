@@ -1,1 +1,98 @@
+import requests
+import pandas as pd
 
+YEAR = 2025         # season year
+SEASONTYPE = 2      # 1=preseason, 2=regular season, 3=postseason
+WEEKS = range(1, 19)  # regular season weeks 1–18
+
+def fetch_week_scoreboard(year: int, week: int, seasontype: int = 2):
+    """
+    Calls ESPN's public NFL scoreboard endpoint for a given week.
+    """
+    url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+    params = {
+        "dates": str(year),
+        "seasontype": seasontype,
+        "week": week,
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def build_edges_for_season(year: int, weeks, seasontype: int = 2) -> pd.DataFrame:
+    rows = []
+
+    for week in weeks:
+        print(f"Fetching week {week}...")
+        data = fetch_week_scoreboard(year, week, seasontype)
+        events = data.get("events", [])
+
+        for ev in events:
+            comps = ev.get("competitions", [])
+            if not comps:
+                continue
+            comp = comps[0]
+            competitors = comp.get("competitors", [])
+
+            home_team = away_team = None
+            home_score = away_score = None
+
+            for team_obj in competitors:
+                team_info = team_obj.get("team", {})
+                abbr = team_info.get("abbreviation")
+                score = team_obj.get("score")
+                ha = team_obj.get("homeAway")
+
+                if ha == "home":
+                    home_team = abbr
+                    home_score = int(score) if score is not None and score != "" else None
+                elif ha == "away":
+                    away_team = abbr
+                    away_score = int(score) if score is not None and score != "" else None
+
+            if not home_team or not away_team:
+                continue
+
+            # simple model: use actual result as "model" just to have realistic numbers
+            if home_score is not None and away_score is not None:
+                if home_score > away_score:
+                    model_home_win_prob = 0.75
+                    model_away_win_prob = 0.25
+                elif away_score > home_score:
+                    model_home_win_prob = 0.25
+                    model_away_win_prob = 0.75
+                else:
+                    model_home_win_prob = model_away_win_prob = 0.5
+            else:
+                # game not played yet / future week
+                model_home_win_prob = 0.5
+                model_away_win_prob = 0.5
+
+            # placeholder edges – you’ll replace later with your real model
+            edge_spread = 0.0
+            edge_moneyline = 0.0
+
+            rows.append(
+                {
+                    "week": week,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "home_score": home_score,
+                    "away_score": away_score,
+                    "model_home_win_prob": model_home_win_prob,
+                    "model_away_win_prob": model_away_win_prob,
+                    "edge_spread": edge_spread,
+                    "edge_moneyline": edge_moneyline,
+                }
+            )
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["week", "home_team", "away_team"])
+
+    # Only keep the columns your Streamlit app expects (+ scores if you want)
+    df.to_csv("model_edges_2025.csv", index=False)
+    print(f"✅ Saved {len(df)} games to model_edges_2025.csv")
+    return df
+
+if __name__ == "__main__":
+    build_edges_for_season(YEAR, WEEKS, SEASONTYPE)

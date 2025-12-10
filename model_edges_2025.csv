@@ -4,7 +4,6 @@ import pandas as pd
 YEAR = 2025         # season year
 SEASONTYPE = 2      # 1=preseason, 2=regular season, 3=postseason
 WEEKS = range(1, 19)  # regular season weeks 1–18
-
 def fetch_week_scoreboard(year: int, week: int, seasontype: int = 2):
     """
     Calls ESPN's public NFL scoreboard endpoint for a given week.

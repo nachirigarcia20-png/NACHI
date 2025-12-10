@@ -8,8 +8,57 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import log_loss, brier_score_loss
 
-SEASON = 2025  # you can make this a sidebar widget later if you want
+SEASON = 2025  # you can turn this into a widget later if you want
 
+
+# ---------- Helper functions for betting ----------
+
+def american_to_prob(odds: float) -> float:
+    """
+    Convert American odds to implied probability.
+    Example: -150 -> 0.60, +200 -> 0.333...
+    """
+    if odds is None:
+        return None
+    if odds == 0:
+        return None
+    if odds > 0:
+        return 100.0 / (odds + 100.0)
+    else:
+        return -odds / (-odds + 100.0)
+
+
+def prob_and_odds_to_kelly_edge(p: float, odds: float):
+    """
+    Given model probability p and American odds,
+    return (edge, kelly_fraction).
+    Edge = p - implied_prob
+    Kelly fraction assumes full Kelly on that single market.
+    """
+    implied = american_to_prob(odds)
+    if implied is None:
+        return None, None
+
+    edge = p - implied  # positive = good (model > market)
+
+    # Convert American odds to decimal
+    if odds > 0:
+        decimal_odds = 1.0 + odds / 100.0
+    else:
+        decimal_odds = 1.0 + 100.0 / -odds
+
+    b = decimal_odds - 1.0  # net profit per 1 unit stake if win
+
+    # Kelly formula: f* = (b*p - (1-p)) / b
+    kelly_fraction = (b * p - (1.0 - p)) / b
+
+    if kelly_fraction < 0:
+        kelly_fraction = 0.0  # no bet if negative Kelly
+
+    return edge, kelly_fraction
+
+
+# ---------- Data loading + model building ----------
 
 @st.cache_data(show_spinner=True)
 def load_schedule_and_pbp(season: int):
@@ -27,11 +76,12 @@ def load_schedule_and_pbp(season: int):
         else:
             sched_reg = sched.copy()
 
-    # Played vs future
+    # Ensure key columns exist
     for col in ["game_id", "week", "home_team", "away_team", "home_score", "away_score"]:
         if col not in sched_reg.columns:
             raise ValueError(f"Missing '{col}' in schedule data")
 
+    # Played vs future games
     games_played = sched_reg[
         sched_reg["home_score"].notna() & sched_reg["away_score"].notna()
     ].copy()
@@ -39,7 +89,7 @@ def load_schedule_and_pbp(season: int):
         sched_reg["home_score"].isna() | sched_reg["away_score"].isna()
     ].copy()
 
-    # Build base games table for training
+    # Base games for training
     games = games_played[[
         "game_id", "week", "home_team", "away_team", "home_score", "away_score"
     ]].copy()
@@ -48,7 +98,6 @@ def load_schedule_and_pbp(season: int):
     # Load PBP
     pbp = nfl.load_pbp([season]).to_pandas()
 
-    # Filter to regular season
     if "game_type" in pbp.columns:
         pbp_reg = pbp[pbp["game_type"] == "REG"].copy()
     elif "season_type" in pbp.columns:
@@ -182,14 +231,15 @@ def train_model(games: pd.DataFrame, team_season: pd.DataFrame):
 
 
 def main():
-    st.title("NFL 2025 EPA Model (IG Edition) 🏈")
-    st.write("Season-long EPA-based win probability model using 2025 data only.")
+    st.title("NFL 2025 EPA Model (IG Sports Betting) 🏈")
+    st.write("Season-long EPA win probability model using **2025-only** data, with betting edges vs market odds.")
 
-    with st.spinner("Loading data..."):
+    with st.spinner("Loading data and training model..."):
         sched_reg, games, games_future, pbp_reg, pass_col, rush_col = load_schedule_and_pbp(SEASON)
         team_game, team_season = build_team_epa(pbp_reg, pass_col, rush_col)
         model, feature_cols, results, metrics, model_df = train_model(games, team_season)
 
+    # ---------- MODEL PERFORMANCE ----------
     st.subheader("Model Performance")
     col1, col2, col3 = st.columns(3)
     col1.metric("Games used", metrics["n_games"])
@@ -198,8 +248,9 @@ def main():
 
     st.markdown("---")
 
+    # ---------- TEAM RANKINGS ----------
     st.subheader("Team Rankings (Season EPA)")
-    tab1, tab2, tab3 = st.tabs(["Offense", "Defense", "Raw EPA table"])
+    tab1, tab2, tab3 = st.tabs(["Offense", "Defense", "Full EPA table"])
 
     with tab1:
         off_rank = team_season.sort_values("off_epa", ascending=False)
@@ -214,8 +265,14 @@ def main():
 
     st.markdown("---")
 
+    # ---------- HISTORICAL PROBABILITIES ----------
     st.subheader("Historical Game Probabilities (Played Games)")
-    week_filter = st.slider("Filter by week", int(results["week"].min()), int(results["week"].max()), (int(results["week"].min()), int(results["week"].max())))
+    week_filter = st.slider(
+        "Filter by week",
+        int(results["week"].min()),
+        int(results["week"].max()),
+        (int(results["week"].min()), int(results["week"].max())),
+    )
     mask = (results["week"] >= week_filter[0]) & (results["week"] <= week_filter[1])
     st.dataframe(
         results[mask]
@@ -225,14 +282,15 @@ def main():
 
     st.markdown("---")
 
-    st.subheader("Upcoming Games – Model Predictions")
+    # ---------- UPCOMING GAMES ----------
+    st.subheader("Upcoming Games – Model Win Probabilities")
 
     if len(games_future) == 0:
         st.info("No future games left in the schedule for this season.")
+        preds_view = None
     else:
         future_base = games_future[["game_id", "week", "home_team", "away_team"]].copy()
 
-        # Season EPA tables again
         team_season_home = team_season.rename(columns={"team": "home_team"})
         team_season_home = team_season_home.rename(
             columns={c: "home_" + c for c in team_season_home.columns if c != "home_team"}
@@ -257,34 +315,135 @@ def main():
 
         if len(pred_ready) == 0:
             st.warning("Future games exist, but some teams do not have enough EPA data yet.")
+            preds_view = None
         else:
             X_pred = pred_ready[feature_cols].values
             pred_ready["home_win_prob"] = model.predict_proba(X_pred)[:, 1]
 
             preds_sorted = pred_ready.sort_values("home_win_prob", ascending=False)
-            st.dataframe(
-                preds_sorted[["week", "home_team", "away_team", "home_win_prob"]]
-                .reset_index(drop=True)
-            )
+            preds_view = preds_sorted[["week", "home_team", "away_team", "home_win_prob"]].reset_index(drop=True)
+            st.dataframe(preds_view)
 
     st.markdown("---")
 
-    st.subheader("Head-to-Head Matchup Tool")
+    # ---------- BETTING EDGE CALCULATOR (MONEYLINE / "SPREAD" VIEW) ----------
+    st.subheader("Betting Edge Calculator (Moneyline vs Model)")
+
+    st.write(
+        "Use this to compare your **book odds** (often attached to a spread like -3.5, +7, etc.) "
+        "against the model's **win probability**."
+    )
+
+    col_team_side, col_odds, col_bank, col_spread = st.columns(4)
+
+    # Choose a game source: upcoming or manual
+    game_source = st.radio("Pick game source", ["Upcoming game", "Manual teams"], horizontal=True)
+
+    model_prob = None
+    home_team = None
+    away_team = None
+
+    if game_source == "Upcoming game" and preds_view is not None and len(preds_view) > 0:
+        # Choose game from upcoming slate
+        preds_view["label"] = preds_view["week"].astype(str) + " - " + preds_view["away_team"] + " @ " + preds_view["home_team"]
+        game_choice = st.selectbox("Select upcoming game", preds_view["label"].tolist())
+        chosen_row = preds_view[preds_view["label"] == game_choice].iloc[0]
+        home_team = chosen_row["home_team"]
+        away_team = chosen_row["away_team"]
+        home_prob = chosen_row["home_win_prob"]
+        away_prob = 1.0 - home_prob
+
+        side_choice = col_team_side.selectbox("Betting side", [f"Home: {home_team}", f"Away: {away_team}"])
+        american_odds = col_odds.number_input("Book American odds for your side", value=-110, step=5)
+        bankroll = col_bank.number_input("Bankroll ($)", value=1000.0, step=50.0)
+        spread_label = col_spread.text_input("Spread label (optional, e.g. -3.5, +7)", value="-3.5")
+
+        if "Home" in side_choice:
+            model_prob = home_prob
+        else:
+            model_prob = away_prob
+
+    else:
+        # Manual team vs team matchup using season EPA
+        teams_sorted = sorted(team_season["team"].unique())
+        col_home, col_away = st.columns(2)
+        home_team = col_home.selectbox("Home team", teams_sorted, key="bet_home_team")
+        away_team = col_away.selectbox("Away team", teams_sorted, key="bet_away_team")
+
+        american_odds = col_odds.number_input("Book American odds for your side", value=-110, step=5)
+        bankroll = col_bank.number_input("Bankroll ($)", value=1000.0, step=50.0)
+        spread_label = col_spread.text_input("Spread label (optional, e.g. -3.5, +7)", value="-3.5")
+
+        side_choice = col_team_side.selectbox("Betting side", [f"Home: {home_team}", f"Away: {away_team}"])
+
+        th = team_season[team_season["team"] == home_team].iloc[0]
+        ta = team_season[team_season["team"] == away_team].iloc[0]
+
+        row = {
+            "home_off_epa": th["off_epa"],
+            "home_pass_epa": th["pass_epa"],
+            "home_rush_epa": th["rush_epa"],
+            "home_def_epa": th["def_epa"],
+            "away_off_epa": ta["off_epa"],
+            "away_pass_epa": ta["pass_epa"],
+            "away_rush_epa": ta["rush_epa"],
+            "away_def_epa": ta["def_epa"],
+        }
+        X_single = np.array([[row[c] for c in [
+            "home_off_epa", "home_pass_epa", "home_rush_epa", "home_def_epa",
+            "away_off_epa", "away_pass_epa", "away_rush_epa", "away_def_epa",
+        ]]])
+        home_prob = model.predict_proba(X_single)[0, 1]
+        away_prob = 1.0 - home_prob
+
+        if "Home" in side_choice:
+            model_prob = home_prob
+        else:
+            model_prob = away_prob
+
+    if home_team is not None and away_team is not None:
+        st.write(f"**Matchup:** {away_team} @ {home_team}")
+        if st.button("Calculate betting edge"):
+            implied = american_to_prob(american_odds)
+            edge, kelly_fraction = prob_and_odds_to_kelly_edge(model_prob, american_odds)
+
+            if implied is None or edge is None:
+                st.error("Invalid odds input.")
+            else:
+                st.write(f"Model win probability for your side: **{model_prob:.3f}**")
+                st.write(f"Book implied probability (odds {american_odds:+}): **{implied:.3f}**")
+                st.write(f"Edge (model - book): **{(edge * 100):.1f} percentage points**")
+
+                if kelly_fraction is not None and kelly_fraction > 0:
+                    kelly_bet = bankroll * kelly_fraction
+                    st.success(
+                        f"Full Kelly fraction: **{kelly_fraction:.3f}** of bankroll → "
+                        f"Bet about **${kelly_bet:,.0f}** on this side."
+                    )
+                    st.caption("You can use half-Kelly or quarter-Kelly in real life to reduce risk.")
+                else:
+                    st.warning("Kelly fraction ≤ 0 → model says this is **not a +EV bet** at these odds.")
+
+                if spread_label.strip():
+                    st.caption(f"Spread tag for your notes: **{spread_label}**")
+
+    st.markdown("---")
+
+    st.subheader("Simple Matchup Model (No Odds)")
 
     teams_sorted = sorted(team_season["team"].unique())
-    col_home, col_away = st.columns(2)
-    home_team = col_home.selectbox("Home team", teams_sorted, key="home_team")
-    away_team = col_away.selectbox("Away team", teams_sorted, key="away_team")
+    col_home2, col_away2 = st.columns(2)
+    h2 = col_home2.selectbox("Home team (model only)", teams_sorted, key="home_model_only")
+    a2 = col_away2.selectbox("Away team (model only)", teams_sorted, key="away_model_only")
 
-    if st.button("Predict this matchup"):
-        if home_team == away_team:
+    if st.button("Predict this matchup (pure model)"):
+        if h2 == a2:
             st.error("Home and away teams must be different.")
         else:
-            # Build a fake game row from season EPA only
-            th = team_season[team_season["team"] == home_team].iloc[0]
-            ta = team_season[team_season["team"] == away_team].iloc[0]
+            th = team_season[team_season["team"] == h2].iloc[0]
+            ta = team_season[team_season["team"] == a2].iloc[0]
 
-            row = {
+            row2 = {
                 "home_off_epa": th["off_epa"],
                 "home_pass_epa": th["pass_epa"],
                 "home_rush_epa": th["rush_epa"],
@@ -294,12 +453,14 @@ def main():
                 "away_rush_epa": ta["rush_epa"],
                 "away_def_epa": ta["def_epa"],
             }
-            X_single = np.array([[row[c] for c in [
+            X_single2 = np.array([[row2[c] for c in [
                 "home_off_epa", "home_pass_epa", "home_rush_epa", "home_def_epa",
                 "away_off_epa", "away_pass_epa", "away_rush_epa", "away_def_epa",
             ]]])
-            prob = model.predict_proba(X_single)[0, 1]
-            st.success(f"Model home win probability ({home_team} vs {away_team}): **{prob:.3f}**")
+            p_home = model.predict_proba(X_single2)[0, 1]
+            p_away = 1.0 - p_home
+            st.write(f"Home ({h2}) win probability: **{p_home:.3f}**")
+            st.write(f"Away ({a2}) win probability: **{p_away:.3f}**")
 
 if __name__ == "__main__":
     main()

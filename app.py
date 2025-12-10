@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import nflreadpy as nfl
+import requests
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -464,3 +465,161 @@ def main():
 
 if __name__ == "__main__":
     main()
+@st.cache_data(show_spinner=True, ttl=300)
+def fetch_live_odds():
+    """
+    Fetch live NFL odds (moneyline + spread) from an external API.
+    Uses Streamlit secrets:
+      - ODDS_API_KEY
+      - ODDS_API_URL
+      - ODDS_REGION
+      - ODDS_MARKETS
+    Returns a DataFrame with:
+      game_id_key, home_team, away_team,
+      home_ml, away_ml, home_spread_odds, away_spread_odds, spread_point
+    """
+    api_key = st.secrets["ODDS_API_KEY"]
+    base_url = st.secrets["ODDS_API_URL"]
+    region = st.secrets.get("ODDS_REGION", "us")
+    markets = st.secrets.get("ODDS_MARKETS", "h2h,spreads")
+
+    params = {
+        "apiKey": api_key,
+        "regions": region,
+        "markets": markets,
+        "oddsFormat": "american",
+    }
+
+    resp = requests.get(base_url, params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+
+    rows = []
+
+    for game in data:
+        home = game["home_team"]
+        away = game["away_team"]
+
+        # key we'll use to merge with preds: "Away @ Home"
+        game_key = f"{away} @ {home}"
+
+        home_ml = away_ml = None
+        home_spread_odds = away_spread_odds = None
+        spread_point = None
+
+        bookmakers = game.get("bookmakers", [])
+        if not bookmakers:
+            continue
+
+        # take the first bookmaker (or you can choose by name)
+        book = bookmakers[0]
+
+        for market in book.get("markets", []):
+            if market["key"] == "h2h":
+                for out in market.get("outcomes", []):
+                    if out["name"] == home:
+                        home_ml = out["price"]
+                    elif out["name"] == away:
+                        away_ml = out["price"]
+
+            elif market["key"] == "spreads":
+                for out in market.get("outcomes", []):
+                    if out["name"] == home:
+                        home_spread_odds = out["price"]
+                        spread_point = out["point"]
+                    elif out["name"] == away:
+                        away_spread_odds = out["price"]
+
+        rows.append({
+            "game_id_key": game_key,
+            "home_team": home,
+            "away_team": away,
+            "home_ml": home_ml,
+            "away_ml": away_ml,
+            "home_spread_odds": home_spread_odds,
+            "away_spread_odds": away_spread_odds,
+            "spread_point": spread_point,
+        })
+
+    return pd.DataFrame(rows)
+st.subheader("Upcoming Games – Model Win Probabilities")
+...
+st.dataframe(preds_view)
+    # ---------- LIVE ODDS + EDGE TABLE FOR THIS WEEK ----------
+    st.subheader("Live Moneyline & Spread – Edges for This Week")
+
+    try:
+        if preds_view is None or len(preds_view) == 0:
+            st.info("No upcoming games with model predictions yet.")
+        else:
+            # Define "this week" as the next upcoming week in preds_view
+            this_week = int(preds_view["week"].min())
+            st.write(f"Showing edges for **week {this_week}** upcoming games.")
+
+            week_preds = preds_view[preds_view["week"] == this_week].copy()
+            week_preds["game_id_key"] = week_preds["away_team"] + " @ " + week_preds["home_team"]
+
+            odds_df = fetch_live_odds()
+            if odds_df.empty:
+                st.warning("No live odds returned from the odds API.")
+            else:
+                merged = week_preds.merge(odds_df, on="game_id_key", how="left")
+
+                # Compute implied probs from moneyline
+                merged["home_implied"] = merged["home_ml"].apply(american_to_prob)
+                merged["away_implied"] = merged["away_ml"].apply(american_to_prob)
+
+                # Edge = model_prob - implied_prob
+                merged["home_edge"] = merged["home_win_prob"] - merged["home_implied"]
+                merged["away_win_prob"] = 1.0 - merged["home_win_prob"]
+                merged["away_edge"] = merged["away_win_prob"] - merged["away_implied"]
+
+                # Best side & best edge
+                merged["best_side"] = np.where(
+                    merged["home_edge"] >= merged["away_edge"],
+                    merged["home_team"],
+                    merged["away_team"],
+                )
+                merged["best_side_edge"] = merged[["home_edge", "away_edge"]].max(axis=1)
+
+                # Convert edges to %
+                merged["home_edge_pct"] = merged["home_edge"] * 100.0
+                merged["away_edge_pct"] = merged["away_edge"] * 100.0
+                merged["best_edge_pct"] = merged["best_side_edge"] * 100.0
+
+                # We'll display a clean table
+                display_cols = [
+                    "week",
+                    "home_team", "away_team",
+                    "home_win_prob",
+                    "home_ml", "home_implied", "home_edge_pct",
+                    "away_ml", "away_implied", "away_edge_pct",
+                    "spread_point", "home_spread_odds", "away_spread_odds",
+                    "best_side", "best_edge_pct",
+                ]
+
+                merged_display = merged[display_cols].copy()
+
+                # Highlight big edges (e.g. >= 5%)
+                EDGE_THRESHOLD = 5.0  # percent
+
+                def highlight_big_edges(row):
+                    color_row = [""] * len(row)
+                    try:
+                        edge = row["best_edge_pct"]
+                        if pd.notna(edge) and edge >= EDGE_THRESHOLD:
+                            # light green background for strong +EV spots
+                            color_row = ["background-color: rgba(0, 255, 0, 0.25)"] * len(row)
+                    except Exception:
+                        pass
+                    return color_row
+
+                styled = merged_display.style.apply(highlight_big_edges, axis=1)
+
+                st.dataframe(styled, use_container_width=True)
+                st.caption(
+                    f"Rows highlighted when the model edge on the best side is ≥ {EDGE_THRESHOLD:.1f}%."
+                )
+
+    except Exception as e:
+        st.error(f"Could not fetch or merge live odds: {e}")

@@ -1,13 +1,7 @@
 week – NFL week number (integer)
-
 home_team – e.g. KC, BUF, DAL
-
 away_team
-
 model_home_win_prob – number between 0 and 1
-
 model_away_win_prob – number between 0 and 1
-
 edge_spread – your edge vs spread 
-
 edge_moneyline – your edge vs moneyline 

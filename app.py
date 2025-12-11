@@ -2,172 +2,199 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# --------------------------
-# Load data
-# --------------------------
+st.set_page_config(
+    page_title="NFL Betting Model",
+    layout="wide"
+)
+
 @st.cache_data
 def load_data():
-    df = pd.read_csv("nfl_2025_edges_with_model.csv")
+    try:
+        df = pd.read_csv("nfl_2025_edges_with_model.csv")
+    except Exception as e:
+        st.error(f"Error loading nfl_2025_edges_with_model.csv: {e}")
+        return None
 
-    expected_cols = [
-        "week", "home_team", "away_team",
-        "home_score", "away_score",
-        "model_home_prob", "implied_home_prob",
-        "edge_home", "home_market_ml", "away_market_ml",
-    ]
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = np.nan
+    # Basic required columns check
+    required_cols = ["home_team", "away_team"]
+    for c in required_cols:
+        if c not in df.columns:
+            st.error(f"Missing required column in CSV: {c}")
+            return None
 
-    # If game_date exists, parse it and create day_of_week
-    if "game_date" in df.columns:
-        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-        df["day_of_week"] = df["game_date"].dt.day_name()
-    else:
-        df["day_of_week"] = np.nan
+    # Ensure week column exists
+    if "week" not in df.columns:
+        df["week"] = 0
+
+    # Compute implied_home_prob if missing
+    if "implied_home_prob" not in df.columns and "home_market_ml" in df.columns:
+        def ml_to_prob(ml):
+            try:
+                ml = float(ml)
+            except (TypeError, ValueError):
+                return np.nan
+            if ml > 0:
+                return 100 / (ml + 100)
+            else:
+                return -ml / (-ml + 100)
+        df["implied_home_prob"] = df["home_market_ml"].apply(ml_to_prob)
+
+    # Compute edge if missing and we have model_home_prob
+    if "edge" not in df.columns and "model_home_prob" in df.columns and "implied_home_prob" in df.columns:
+        df["edge"] = df["model_home_prob"] - df["implied_home_prob"]
+
+    # If bet_units missing, set to 0
+    if "bet_units" not in df.columns:
+        df["bet_units"] = 0.0
+
+    # Default recommend_bet if missing
+    if "recommend_bet" not in df.columns and "edge" in df.columns:
+        df["recommend_bet"] = (df["edge"] > 0.04) & (df["bet_units"] >= 0.25)
 
     return df
 
+
 df = load_data()
+if df is None:
+    st.stop()
 
-st.title("🏈 NFL 2025 – Sportsbook Edge Model")
-st.write("Model vs Sportsbook: find where your model disagrees with the moneyline and shows an **edge**.")
+st.title("🏈 NFL Betting Model Dashboard")
 
-# --------------------------
-# SIDEBAR CONTROLS
-# --------------------------
+# ---------- SIDEBAR FILTERS ----------
 st.sidebar.header("Filters")
 
-valid_weeks = sorted(df["week"].dropna().unique().tolist())
-default_week = int(max(valid_weeks)) if valid_weeks else 1
-
-selected_week = st.sidebar.selectbox(
-    "Select week",
-    options=valid_weeks,
-    index=valid_weeks.index(default_week) if valid_weeks else 0,
-)
-
-edge_threshold = st.sidebar.slider(
-    "Minimum edge to show (in %)",
-    min_value=1,
-    max_value=15,
-    value=5,
-    step=1,
-)
-
-edge_thr_decimal = edge_threshold / 100.0
-
-# Thursday filter (if we have day_of_week info)
-day_filter = None
-if df["day_of_week"].notna().any():
-    thursday_only = st.sidebar.checkbox("Show only Thursday games", value=False)
-    if thursday_only:
-        day_filter = ["Thursday"]
-
-# Hide games with no bet?
-only_bets = st.sidebar.checkbox("Show only recommended bets", value=True)
-
-# --------------------------
-# Helper to label bets
-# --------------------------
-def decide_side(row, thr):
-    edge = row["edge_home"]
-    if pd.isna(edge) or pd.isna(row["implied_home_prob"]):
-        return "No odds"
-    if edge >= thr:
-        return f"{row['home_team']} ML"
-    elif edge <= -thr:
-        return f"{row['away_team']} ML"
-    else:
-        return "No Bet"
-
-# Row styling
-def style_bet_rows(row):
-    rec = row["bet_recommendation"]
-    if "ML" in str(rec):
-        # Strong bet recommendation → light green background
-        return ["background-color: rgba(0, 200, 0, 0.15)"] * len(row)
-    elif rec == "No Bet":
-        # No Bet → light gray background
-        return ["background-color: rgba(150, 150, 150, 0.10)"] * len(row)
-    else:
-        return [""] * len(row)
-
-# --------------------------
-# Filter for selected week
-# --------------------------
-week_df = df[df["week"] == selected_week].copy()
-
-# If Thursday-only is on and we have day info
-if day_filter is not None:
-    week_df = week_df[week_df["day_of_week"].isin(day_filter)]
-
-# We can only use rows with model prob
-week_df = week_df[week_df["model_home_prob"].notna()].copy()
-
-# Calculate bet recommendation
-week_df["bet_recommendation"] = week_df.apply(
-    decide_side,
-    axis=1,
-    thr=edge_thr_decimal,
-)
-
-week_df["model_home_prob_%"] = (week_df["model_home_prob"] * 100).round(1)
-week_df["implied_home_prob_%"] = (week_df["implied_home_prob"] * 100).round(1)
-week_df["edge_%"] = (week_df["edge_home"] * 100).round(1)
-
-# Separate upcoming vs past based on scores
-upcoming_games = week_df[week_df["home_score"].isna()].copy()
-past_games = week_df[week_df["home_score"].notna()].copy()
-
-if only_bets:
-    upcoming_games = upcoming_games[upcoming_games["bet_recommendation"].str.contains("ML", na=False)]
-    past_games = past_games[past_games["bet_recommendation"].str.contains("ML", na=False)]
-
-# --------------------------
-# Upcoming games – what to bet
-# --------------------------
-st.header(f"📅 Week {selected_week} – Upcoming games & edges")
-
-if upcoming_games.empty:
-    st.info("No upcoming games with odds and edges for this selection.")
+weeks = sorted(df["week"].dropna().unique().tolist())
+if len(weeks) > 0:
+    selected_week = st.sidebar.selectbox("Week", options=["All"] + weeks, index=0)
 else:
-    show_cols_upcoming = [
-        "away_team", "home_team",
-        "home_market_ml", "away_market_ml",
-        "model_home_prob_%", "implied_home_prob_%",
-        "edge_%", "bet_recommendation",
+    selected_week = "All"
+
+teams = sorted(set(df["home_team"]).union(set(df["away_team"])))
+selected_teams = st.sidebar.multiselect("Filter by team (home or away)", options=teams, default=[])
+
+df_filtered = df.copy()
+
+if selected_week != "All":
+    df_filtered = df_filtered[df_filtered["week"] == selected_week]
+
+if selected_teams:
+    df_filtered = df_filtered[
+        df_filtered["home_team"].isin(selected_teams)
+        | df_filtered["away_team"].isin(selected_teams)
     ]
 
-    st.subheader("Suggested bets (based on edge vs sportsbook)")
-    styled_upcoming = (
-        upcoming_games[show_cols_upcoming]
-        .sort_values("edge_%", ascending=False)
-        .style.apply(style_bet_rows, axis=1)
-    )
-    st.dataframe(styled_upcoming, use_container_width=True)
+# ---------- MAIN GAMES TABLE ----------
+st.header("📊 All Games")
 
-# --------------------------
-# Past games – backtest
-# --------------------------
-st.header(f"📊 Week {selected_week} – Completed games (backtest)")
+# Columns we *try* to show
+main_cols = [
+    "week",
+    "home_team",
+    "away_team",
+    "home_market_ml",
+    "home_market_spread",
+    "model_home_prob",
+    "implied_home_prob",
+    "edge",
+    "model_margin",
+    "model_total_points",
+    "bet_units",
+]
 
-if past_games.empty:
-    st.info("No completed games with model edges for this selection.")
+main_cols = [c for c in main_cols if c in df_filtered.columns]
+
+if df_filtered.empty:
+    st.info("No games match your current filters.")
 else:
-    show_cols_past = [
-        "away_team", "home_team",
-        "away_score", "home_score",
+    table = df_filtered[main_cols].copy()
+
+    # Pretty formatting
+    if "model_home_prob" in table.columns:
+        table["model_home_prob"] = (table["model_home_prob"] * 100).round(1).astype(str) + "%"
+    if "implied_home_prob" in table.columns:
+        table["implied_home_prob"] = (table["implied_home_prob"] * 100).round(1).astype(str) + "%"
+    if "edge" in table.columns:
+        table["edge"] = (table["edge"] * 100).round(2).astype(str) + "%"
+    if "bet_units" in table.columns:
+        table["bet_units"] = table["bet_units"].round(2)
+
+    st.dataframe(table, use_container_width=True)
+
+# ---------- RECOMMENDED BETS (KELLY) ----------
+st.header("📈 Recommended Bets (Kelly Sizing)")
+
+bets = df.copy()
+
+# If implied prob still missing in original df, compute it quickly
+if "implied_home_prob" not in bets.columns and "home_market_ml" in bets.columns:
+    def ml_to_prob2(ml):
+        try:
+            ml = float(ml)
+        except (TypeError, ValueError):
+            return np.nan
+        if ml > 0:
+            return 100 / (ml + 100)
+        else:
+            return -ml / (-ml + 100)
+    bets["implied_home_prob"] = bets["home_market_ml"].apply(ml_to_prob2)
+
+# UI controls
+col1, col2, col3 = st.columns(3)
+with col1:
+    min_edge_pct = st.slider("Minimum edge (%)", 0.0, 15.0, 4.0, 0.5)
+with col2:
+    min_units = st.slider("Minimum bet size (units)", 0.0, 5.0, 0.25, 0.25)
+with col3:
+    this_week_only = st.checkbox("Show this week only", value=True)
+
+bets_rec = bets.copy()
+
+# Only rows that are recommended if column exists
+if "recommend_bet" in bets_rec.columns:
+    bets_rec = bets_rec[bets_rec["recommend_bet"]]
+
+# Filter by edge & units
+if "edge" in bets_rec.columns:
+    bets_rec = bets_rec[bets_rec["edge"] * 100 >= min_edge_pct]
+if "bet_units" in bets_rec.columns:
+    bets_rec = bets_rec[bets_rec["bet_units"] >= min_units]
+
+# Filter to current week if requested
+if this_week_only and "week" in bets_rec.columns and len(weeks) > 0:
+    current_week = max(weeks)
+    bets_rec = bets_rec[bets_rec["week"] == current_week]
+
+# Sort by biggest edge
+if "edge" in bets_rec.columns:
+    bets_rec = bets_rec.sort_values("edge", ascending=False)
+
+if bets_rec.empty:
+    st.info("No bets meet your current edge / unit criteria.")
+else:
+    rec_cols = [
+        "week",
+        "home_team",
+        "away_team",
         "home_market_ml",
-        "model_home_prob_%", "implied_home_prob_%",
-        "edge_%", "bet_recommendation",
+        "home_market_spread",
+        "model_home_prob",
+        "implied_home_prob",
+        "edge",
+        "bet_units",
     ]
+    rec_cols = [c for c in rec_cols if c in bets_rec.columns]
+    rec_table = bets_rec[rec_cols].copy()
 
-    styled_past = (
-        past_games[show_cols_past]
-        .sort_values("edge_%", ascending=False)
-        .style.apply(style_bet_rows, axis=1)
-    )
-    st.dataframe(styled_past, use_container_width=True)
+    # Pretty formatting
+    if "model_home_prob" in rec_table.columns:
+        rec_table["model_home_prob"] = (rec_table["model_home_prob"] * 100).round(1).astype(str) + "%"
+    if "implied_home_prob" in rec_table.columns:
+        rec_table["implied_home_prob"] = (rec_table["implied_home_prob"] * 100).round(1).astype(str) + "%"
+    if "edge" in rec_table.columns:
+        rec_table["edge"] = (rec_table["edge"] * 100).round(2).astype(str) + "%"
+    if "bet_units" in rec_table.columns:
+        rec_table["bet_units"] = rec_table["bet_units"].round(2)
 
-st.caption("Edge = model_home_prob − implied_home_prob (from sportsbook moneyline). Green rows = bet; gray rows = pass.")
+    st.dataframe(rec_table, use_container_width=True)
+
+st.caption("Model outputs are for informational purposes only and do not guarantee future results.")
